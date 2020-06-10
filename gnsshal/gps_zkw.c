@@ -38,12 +38,14 @@
 #include <hardware/gps.h>
 
 #define UNUSED(x) (void)(x)
+#define MEASUREMENT_SUPPLY      0
 /* the name of the controlled socket */
 #define GPS_CHANNEL_NAME        "/dev/ttyAMA3"
 #define TTY_BAUD                B115200	//B9600
 //#define TTY_BAUD                B9600
 
 #define SVID_PLUS_GLONASS       64
+#define SVID_PLUS_GALILEO       100
 #define SVID_PLUS_BEIDOU        200
 
 #define  GPS_DEBUG  1
@@ -59,10 +61,12 @@
 #  define VER(...)    ((void)0)
 #  define ERR(...)    ((void)0)
 #endif
+static GpsStatus gps_status;
 static int flag_unlock = 0;
-GpsStatus gps_status;
 const char* gps_native_thread = "GPS NATIVE THREAD";
 static GpsCallbacks callback_backup;
+static GpsMeasurementCallbacks measurement_callbacks;
+static int is_measurement = 0;
 static float report_time_interval = 0;
 static int started = 0;
 /*****************************************************************************/
@@ -238,9 +242,10 @@ struct svinfo_raw {
 };
 */
 
+#define HAS_CARRIER_FREQUENCY(p)        ((p) >= '1' && (p) <= '9')
 #define MAX_GNSS_SVID   300
 // #define  NMEA_MAX_SIZE  83
-#define  NMEA_MAX_SIZE  128
+#define  NMEA_MAX_SIZE  256
 /*maximum number of SV information in GPGSV*/
 #define  NMEA_MAX_SV_INFO 4
 #define  LOC_FIXED(pNmeaReader) ((pNmeaReader->fix_mode == 2) || (pNmeaReader->fix_mode ==3))
@@ -271,10 +276,12 @@ typedef struct {
         //GpsSvStatus     sv_status_gps;
         GnssSvStatus    sv_status_gnss;
         GpsCallbacks    callbacks;
+        GnssData        gnss_data;
         char            in[ NMEA_MAX_SIZE+1 ];
         int             sv_status_can_report;
         int             location_can_report;
-        GnssSvInfo      svlst[MAX_GNSS_SVID];
+        char            sv_used_in_fix[MAX_GNSS_SVID];
+        //GnssSvInfo      svlst[MAX_GNSS_SVID];
 } NmeaReader;
 
 
@@ -313,7 +320,7 @@ nmea_reader_init(NmeaReader* const r)
         r->callbacks.location_cb= NULL;
         r->callbacks.status_cb= NULL;
         r->callbacks.sv_status_cb= NULL;
-        r->sv_count = 0;
+        //r->sv_count = 0;
         r->fix_mode = 0;    /*no fix*/
         r->cb_status_changed = 0;
         //memset((void*)&r->sv_status_gps, 0x00, sizeof(r->sv_status_gps));
@@ -332,10 +339,10 @@ nmea_reader_set_callback(NmeaReader* const r, GpsCallbacks* const cbs)
                 return;
         } else {/*register the callback*/
                 r->fix.flags = 0;
-                r->sv_count = 0;
+                //r->sv_count = 0;
                 //r->sv_status_gps.num_svs = 0;
                 r->sv_status_gnss.num_svs = 0;
-                memset(r->svlst, 0, sizeof(r->svlst));
+                // memset(r->svlst, 0, sizeof(r->svlst));
         }
 }
 
@@ -581,6 +588,8 @@ prn2svid(int prn, int constell)
                 return prn;
         case GNSS_CONSTELLATION_GLONASS:
                 return prn + SVID_PLUS_GLONASS;
+        case GNSS_CONSTELLATION_GALILEO:
+                return prn + SVID_PLUS_GALILEO;
         case GNSS_CONSTELLATION_BEIDOU:
                 return prn + SVID_PLUS_BEIDOU;
         default:
@@ -600,58 +609,80 @@ get_svid(int prn, int sv_type)
         return prn;
 }
 */
-/*
-static int
-nmea_reader_update_sv_status_gnss(NmeaReader* r, int sv_index,
-                                  int id, Token elevation,
-                                  Token azimuth, Token snr)
+
+
+static float
+get_carrier_frequency_hz(char frq, int sv_type)
 {
-        int prn = id;
-        sv_index = r->sv_count + r->sv_status_gnss.num_svs;
+        float mhz = 0;
+        switch (sv_type) {
+        case GNSS_CONSTELLATION_GPS:
+                if (frq == '1')
+                        mhz = 1575.42f;
+                else if (frq == '7')
+                        mhz = 1176.45f;
+                break;
+        case GNSS_CONSTELLATION_BEIDOU:
+                if (frq == '1')
+                        mhz = 1561.098f;
+                else if (frq == '7')
+                        mhz = 1575.42f;
+                else if (frq == '8')
+                        mhz = 1176.45f;
+                break;
+        case GNSS_CONSTELLATION_GLONASS:
+                break;
+        default:
+                break;
+        }
+        
+        return mhz * 1000000.0;
+}
+
+static int
+nmea_reader_update_gnss_measurement(NmeaReader*r, int sv_type, int prn, Token frq)
+{
+        int n = r->gnss_data.measurement_count;
+        if (GNSS_MAX_MEASUREMENT <= n) {
+                ERR("ERR: n=[%d] is larger than GNSS_MAX_MEASUREMENT.\n", n);
+                return 1;
+        }
+        r->gnss_data.measurements[n].size = sizeof(GnssMeasurement);
+        r->gnss_data.measurements[n].svid = prn;
+        r->gnss_data.measurements[n].constellation = sv_type;
+        r->gnss_data.measurements[n].flags |= GNSS_MEASUREMENT_HAS_CARRIER_FREQUENCY; 
+        r->gnss_data.measurements[n].carrier_frequency_hz = get_carrier_frequency_hz(frq.p[0], sv_type);
+
+        DBG("Update measurement: prn=%d typ=%d cfrq=%f", prn, sv_type, r->gnss_data.measurements[n].carrier_frequency_hz);
+
+        r->gnss_data.measurement_count++;
+        return 0;
+}
+
+static int
+nmea_reader_update_sv_status_gnss(NmeaReader* r, int sv_type, int prn, Token elevation, Token azimuth, Token snr)
+{
+        int sv_index = r->sv_status_gnss.num_svs;
         if (GNSS_MAX_SVS <= sv_index) {
                 ERR("ERR: sv_index=[%d] is larger than GNSS_MAX_SVS.\n", sv_index);
-                return 0;
+                return 1;
         }
-
-        if ((prn > 0) && (prn < 32)) {
-                r->sv_status_gnss.gnss_sv_list[sv_index].svid = prn;
-                r->sv_status_gnss.gnss_sv_list[sv_index].constellation = GNSS_CONSTELLATION_GPS;
-        } else if ((prn >= 65) && (prn <= 96)) {
-                r->sv_status_gnss.gnss_sv_list[sv_index].svid = prn-64;
-                r->sv_status_gnss.gnss_sv_list[sv_index].constellation = GNSS_CONSTELLATION_GLONASS;
-        } else if ((prn >= 201) && (prn <= 237)) {
-                r->sv_status_gnss.gnss_sv_list[sv_index].svid = prn-200;
-                r->sv_status_gnss.gnss_sv_list[sv_index].constellation = GNSS_CONSTELLATION_BEIDOU;
-        } else if ((prn >= 401) && (prn <= 436)) {
-                r->sv_status_gnss.gnss_sv_list[sv_index].svid = prn-400;
-                r->sv_status_gnss.gnss_sv_list[sv_index].constellation = GNSS_CONSTELLATION_GALILEO;
-        } else {
-                DBG("sv_status: ignore (%d)", prn);
-                return 0;
-        }
+        r->sv_status_gnss.gnss_sv_list[sv_index].svid = prn;
+        r->sv_status_gnss.gnss_sv_list[sv_index].constellation = sv_type;
 
         r->sv_status_gnss.gnss_sv_list[sv_index].c_n0_dbhz = str2float(snr.p, snr.end);
         r->sv_status_gnss.gnss_sv_list[sv_index].elevation = str2int(elevation.p, elevation.end);
         r->sv_status_gnss.gnss_sv_list[sv_index].azimuth = str2int(azimuth.p, azimuth.end);
         r->sv_status_gnss.gnss_sv_list[sv_index].flags = 0;
-        if (1 == r->sv_used_in_fix[prn]) {
+        if (r->sv_used_in_fix[prn2svid(prn, sv_type)])
                 r->sv_status_gnss.gnss_sv_list[sv_index].flags |= GNSS_SV_FLAGS_USED_IN_FIX;
-        }
 
-        r->sv_count++;
-        DBG("sv_status(%2d): %2d, %d, %2f, %3f, %2f, %d",
-            sv_index, r->sv_status_gnss.gnss_sv_list[sv_index].svid, r->sv_status_gnss.gnss_sv_list[sv_index].constellation,
-            r->sv_status_gnss.gnss_sv_list[sv_index].elevation, r->sv_status_gnss.gnss_sv_list[sv_index].azimuth,
-            r->sv_status_gnss.gnss_sv_list[sv_index].c_n0_dbhz, r->sv_status_gnss.gnss_sv_list[sv_index].flags);
+        DBG("Update SV: prn=%d typ=%d use=%d\n", prn, sv_type, r->sv_used_in_fix[prn2svid(prn, sv_type)]); 
+
+        //r->sv_count++;
+        r->sv_status_gnss.num_svs++;
         return 0;
  }
- */
-
-static int
-nmax(int a, int b)
-{
-        return a > b ? a : b;
-}
 
 static void
 nmea_reader_parse(NmeaReader* const r)
@@ -695,11 +726,14 @@ nmea_reader_parse(NmeaReader* const r)
         if (!memcmp(tok.p, "BD", 2)) {
                 sv_type = GNSS_CONSTELLATION_BEIDOU;
                 DBG("BDS SV type");
-        }
-        else if (!memcmp(tok.p, "GL", 2)) {
+        } else if (!memcmp(tok.p, "GL", 2)) {
                 sv_type = GNSS_CONSTELLATION_GLONASS;
                 DBG("GLN SV type");
+        } else if (!memcmp(tok.p, "GA", 2)) {
+                sv_type = GNSS_CONSTELLATION_GALILEO;
+                DBG("GAL SV type");
         }
+
         tok.p += 2;
         if (!memcmp(tok.p, "GGA", 3)) {
                 //  GPS fix
@@ -729,6 +763,9 @@ nmea_reader_parse(NmeaReader* const r)
                 case '2':
                         sv_type = GNSS_CONSTELLATION_GLONASS;
                         break;
+                case '3':
+                        sv_type = GNSS_CONSTELLATION_GALILEO;
+                        break;
                 case '4':
                         sv_type = GNSS_CONSTELLATION_BEIDOU;
                         break;
@@ -752,7 +789,8 @@ nmea_reader_parse(NmeaReader* const r)
                                 int prn = str2int(tok_satellite.p, tok_satellite.end);
                                 int svid = prn2svid(prn, sv_type);
                                 if (svid >= 0 && svid < MAX_GNSS_SVID)
-                                        r->svlst[svid].flags |= GNSS_SV_FLAGS_USED_IN_FIX;
+                                        r->sv_used_in_fix[svid] = 1;
+                                //        r->svlst[svid].flags |= GNSS_SV_FLAGS_USED_IN_FIX;
                         }
                 }
         }
@@ -789,32 +827,39 @@ nmea_reader_parse(NmeaReader* const r)
                 int num = str2int(tok_num.p, tok_num.end);
                 int seq = str2int(tok_seq.p, tok_seq.end);
                 int cnt = str2int(tok_cnt.p, tok_cnt.end);
-                int sv_base = (seq - 1)*NMEA_MAX_SV_INFO;
+                int sv_base = (seq - 1) * NMEA_MAX_SV_INFO;
                 int sv_num = cnt - sv_base;
                 int idx, base = 4, base_idx;
+
                 if (sv_num > NMEA_MAX_SV_INFO)
                         sv_num = NMEA_MAX_SV_INFO;
-                if (seq == 1)   /*if sequence number is 1, a new set of GSV will be parsed*/
+
+                Token tok_frq = nmea_tokenizer_get(tzer, base + sv_num * 4);
+
+                /*
+                if (seq == 1)  
                         r->sv_count = 0;
+                */
+
                 for (idx = 0; idx < sv_num; idx++) {
                         base_idx = base*(idx+1);
                         Token tok_id  = nmea_tokenizer_get(tzer, base_idx+0);
                         int prn = str2int(tok_id.p, tok_id.end);
-                        int svid = prn2svid(prn, sv_type);
+                        //int svid = prn2svid(prn, sv_type);
 
                         Token tok_ele = nmea_tokenizer_get(tzer, base_idx+1);
                         Token tok_azi = nmea_tokenizer_get(tzer, base_idx+2);
                         Token tok_snr = nmea_tokenizer_get(tzer, base_idx+3);
-                        if (svid >= 0 && svid < MAX_GNSS_SVID) {
-                                r->svlst[svid].c_n0_dbhz = nmax(str2int(tok_snr.p, tok_snr.end), 
-                                                                r->svlst[svid].c_n0_dbhz);
-                                r->svlst[svid].elevation = str2int(tok_ele.p, tok_ele.end);
-                                r->svlst[svid].azimuth = str2int(tok_azi.p, tok_azi.end);
-                                r->svlst[svid].svid = prn;
-                                r->svlst[svid].constellation = sv_type;
-                        }
-                                
-                        //nmea_reader_update_sv_status_gnss(r, sv_base+idx, svid, tok_ele, tok_azi, tok_snr);
+                        /*
+                        sv_arr[idx].c_n0_dbhz = str2int(tok_snr.p, tok_snr.end);
+                        sv_arr[idx].elevation = str2int(tok_ele.p, tok_ele.end);
+                        sv_arr[idx].azimuth = str2int(tok_azi.p, tok_azi.end);
+                        sv_arr[idx].svid = prn;
+                        sv_arr[idx].constellation = sv_type;
+                        */
+                        nmea_reader_update_sv_status_gnss(r, sv_type, prn, tok_ele, tok_azi, tok_snr);
+                        if (HAS_CARRIER_FREQUENCY(tok_frq.p[0]))
+                                nmea_reader_update_gnss_measurement(r, sv_type, prn, tok_frq);
                 }
                 if (seq == num) {
                 /*
@@ -885,15 +930,23 @@ nmea_reader_parse(NmeaReader* const r)
         DBG("r->sv_status_gnss.num_svs = %d, gps_nmea_end_tag = %d, sv_status_can_report = %d", 
                 r->sv_status_gnss.num_svs, gps_nmea_end_tag, r->sv_status_can_report);
         if (r->sv_status_can_report) {
-                /*
-                if (r->sv_status_gnss.num_svs != 0) {
+                DBG("Report sv status, num = %d", r->sv_status_gnss.num_svs);
+                if (r->sv_status_gnss.num_svs > 0) {
                         r->sv_status_gnss.size = sizeof(GnssSvStatus);
-                        DBG("Report sv status");
                         callback_backup.gnss_sv_status_cb(&r->sv_status_gnss);
-                        r->sv_count = r->sv_status_gnss.num_svs = 0;
-                        memset(r->sv_used_in_fix, 0, 256*sizeof(int));
+                        //r->sv_count = r->sv_status_gnss.num_svs = 0;
+                        memset(r->sv_used_in_fix, 0, sizeof(r->sv_used_in_fix));
+                        memset(&r->sv_status_gnss, 0, sizeof(r->sv_status_gnss));
                 }
-                */
+                DBG("Report gnss measurements, num = %d, measure_on = %d", 
+                                        (int)r->gnss_data.measurement_count, is_measurement);
+                if (r->gnss_data.measurement_count > 0) {
+                        r->gnss_data.size = sizeof(GnssData);
+                        if (is_measurement)
+                                measurement_callbacks.gnss_measurement_callback(&r->gnss_data);
+                        memset(&r->gnss_data, 0, sizeof(r->gnss_data));
+                }
+                /*
                 DBG("sv list --> sv status gnss");
                 int sv_count = 0;
                 for (int i = 0; i < MAX_GNSS_SVID; i++) {
@@ -910,6 +963,7 @@ nmea_reader_parse(NmeaReader* const r)
                         callback_backup.gnss_sv_status_cb(&r->sv_status_gnss);
 
                 memset(r->svlst, 0, sizeof(r->svlst));
+                */
                 r->sv_status_can_report = 0;
         }
 }
@@ -1030,9 +1084,9 @@ epoll_register(int  epoll_fd, int  fd)
                 ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
         } while (ret < 0 && errno == EINTR);
         if (ret < 0)
-                ERR("epoll ctl error, error num is %d\n, message is %s\n", errno, strerror(errno));
+                ERR("epoll ctl error, fd = %d, error num is %d\n, message is %s\n", fd, errno, strerror(errno));
         return ret;
-}
+ }
 
 /*
 static int
@@ -1066,6 +1120,11 @@ gps_state_thread(void*  arg)
 
         nmea_reader_init(reader);
 
+        if (control_fd == -1 || gps_fd == -1) {
+                ERR("control_fd = %d, gps_fd = %d", control_fd, gps_fd);
+                return;
+        }
+
         //  register control file descriptors for polling
         if (epoll_register(epoll_fd, control_fd) < 0)
                 ERR("epoll register control_fd error, error num is %d\n, message is %s\n", errno, strerror(errno));
@@ -1078,7 +1137,7 @@ gps_state_thread(void*  arg)
         for (;;) {
                 struct epoll_event   events[4];
                 int                  ne, nevents;
-                nevents = epoll_wait(epoll_fd, events, 4, -1);
+                nevents = epoll_wait(epoll_fd, events, 2, -1);
                 if (nevents < 0) {
                         if (errno != EINTR)
                                 ERR("epoll_wait() unexpected error: %s", strerror(errno));
@@ -1340,6 +1399,28 @@ zkw_gps_set_position_mode(GpsPositionMode mode, GpsPositionRecurrence recurrence
         return 0;
 }
 
+static int
+zkw_gps_measurement_init(GpsMeasurementCallbacks *callbacks)
+{
+        measurement_callbacks = *callbacks;
+        is_measurement = 1;
+        DBG("GPS measurement init.");
+        return 0;
+}
+
+static void
+zkw_gps_measurement_close()
+{
+        is_measurement = 0;
+        DBG("GPS measurement closed.");
+}
+
+static const GpsMeasurementInterface zkwGpsMeasurementInterface = {
+        sizeof(GpsMeasurementInterface),
+        zkw_gps_measurement_init,
+        zkw_gps_measurement_close,
+};
+
 static const void*
 zkw_gps_get_extension(const char* name)
 {
@@ -1358,12 +1439,12 @@ zkw_gps_get_extension(const char* name)
             if (strncmp(name, "supl-certificate", strlen(name)) == 0) {
                return &zkwSuplCertificateInterface;
             }
-            if (strncmp(name, GPS_MEASUREMENT_INTERFACE, strlen(name)) == 0) {
-               return &zkwGpsMeasurementInterface;
-            }
             if (strncmp(name, GPS_NAVIGATION_MESSAGE_INTERFACE, strlen(name)) == 0) {
                return &zkwGpsNavigationMessageInterface;
-            }*/
+            }
+        */
+        if (MEASUREMENT_SUPPLY && strncmp(name, GPS_MEASUREMENT_INTERFACE, strlen(name)) == 0)
+                return &zkwGpsMeasurementInterface;
         return NULL;
 }
 
@@ -1379,6 +1460,7 @@ static const GpsInterface  zkwGpsInterface = {
         zkw_gps_set_position_mode,
         zkw_gps_get_extension,
 };
+
 
 const GpsInterface* gps__get_gps_interface(struct gps_device_t* dev)
 {
