@@ -583,18 +583,28 @@ nmea_reader_update_sv_status_gps(NmeaReader* r, int sv_index,
 static int
 prn2svid(int prn, int constell)
 {
+        if (prn <= 0)
+                return 0;
+
         switch (constell) {
         case GNSS_CONSTELLATION_GPS:
-                return prn;
+                break;
         case GNSS_CONSTELLATION_GLONASS:
-                return prn + SVID_PLUS_GLONASS;
+                if (prn > 0 && prn <= 32)
+                        prn += SVID_PLUS_GLONASS;
+                break;
         case GNSS_CONSTELLATION_GALILEO:
-                return prn + SVID_PLUS_GALILEO;
+                if (prn > 0 && prn <= 32)
+                        prn += SVID_PLUS_GALILEO;
+                break;
         case GNSS_CONSTELLATION_BEIDOU:
-                return prn + SVID_PLUS_BEIDOU;
+                if (prn > 0 && prn <= 64)
+                        prn += SVID_PLUS_BEIDOU;
+                break;
         default:
-                return prn;
+                break;
         }
+        return prn;
 }
 
 /*
@@ -1500,7 +1510,7 @@ static struct hw_module_methods_t gps_module_methods = {
 struct hw_module_t HAL_MODULE_INFO_SYM = {
         .tag = HARDWARE_MODULE_TAG,
         .version_major = 1,
-        .version_minor = 0,
+        .version_minor = 1,
         .id = GPS_HARDWARE_MODULE_ID,
         .name = "Hardware GPS Module",
         .author = "",
