@@ -37,25 +37,28 @@
 //#include <hardware/gps7.h>
 #include <hardware/gps.h>
 
+#define MAJOR_NO	1
+#define MINOR_NO	3
 #define UNUSED(x) (void)(x)
 #define MEASUREMENT_SUPPLY      0
 /* the name of the controlled socket */
-#define GPS_CHANNEL_NAME        "/dev/ttyAMA3"
-#define TTY_BAUD                B115200	//B9600
-//#define TTY_BAUD                B9600
+#define GPS_CHANNEL_NAME        "/dev/ttyHS1"
+//#define TTY_BAUD                B115200
+#define TTY_BAUD                B9600
 
 #define SVID_PLUS_GLONASS       64
 #define SVID_PLUS_GALILEO       100
 #define SVID_PLUS_BEIDOU        200
 
 #define  GPS_DEBUG  1
-#define  NEMA_DEBUG 1   /*the flag works if GPS_DEBUG is defined*/
+#define  NMEA_DEBUG 1   /*the flag works if GPS_DEBUG is defined*/
 #if GPS_DEBUG
 #define TRC(f)      ALOGD("%s", __func__)
 #define ERR(f, ...) ALOGE("%s: line = %d, " f, __func__, __LINE__, ##__VA_ARGS__)
 #define WAN(f, ...) ALOGW("%s: line = %d, " f, __func__, __LINE__, ##__VA_ARGS__)
 #define DBG(f, ...) ALOGD("%s: line = %d, " f, __func__, __LINE__, ##__VA_ARGS__)
-#define VER(f, ...) ((void)0)    // ((void)0)   //
+#define VER(f, ...) ALOGD("%s: line = %d, " f, __func__, __LINE__, ##__VA_ARGS__)
+//#define VER(f, ...) ((void)0)    // ((void)0)   //
 #else
 #  define DBG(...)    ((void)0)
 #  define VER(...)    ((void)0)
@@ -122,7 +125,7 @@ nmea_tokenizer_init(NmeaTokenizer*  t, const char*  p, const char*  end)
 
         //  the initial '$' is optional
         if (p < end && p[0] == '$')
-                p += 1;
+                p += 1;gnss_fix_point
 
         //  remove trailing newline
         if (end > p && (*(end-1) == '\n')) {
@@ -134,7 +137,7 @@ nmea_tokenizer_init(NmeaTokenizer*  t, const char*  p, const char*  end)
         //  get rid of checksum at the end of the sentecne
         if (end >= p+3 && (*(end-3) == '*')) {
                 end -= 3;
-        }
+        }gnss_fix_point
 
         while (p < end) {
                 const char*  q = p;
@@ -471,8 +474,8 @@ typedef struct {
         GpsCallbacks            callbacks;
         pthread_t               thread;
         int                     control[2];
-        int                     sockfd;
-        int                     epoll_hd;
+        //int                     fake_fd;
+        int                     epoll_fd;
         int                     flag;
         int                     start_flag;
         //   int                     thread_exit_flag;
@@ -705,7 +708,7 @@ nmea_reader_parse(NmeaReader* const r)
         GnssConstellationType sv_type = GNSS_CONSTELLATION_GPS;
 
 
-#if NEMA_DEBUG
+#if NMEA_DEBUG
         DBG("Received: '%.*s'", r->pos, r->in);
 #endif
         if (r->pos < 9) {
@@ -715,7 +718,7 @@ nmea_reader_parse(NmeaReader* const r)
         if (r->pos < (int)sizeof(r->in)) {
                 nmea_tokenizer_init(tzer, r->in, r->in + r->pos);
         }
-#if NEMA_DEBUG
+#if NMEA_DEBUG
         {
                 int  n;
                 DBG("Found %d tokens", tzer->count);
@@ -898,13 +901,13 @@ nmea_reader_parse(NmeaReader* const r)
         }
         else {
                 tok.p -= 2;
-                VER("unknown sentence '%.*s", tok.end-tok.p, tok.p);
+                VER("unknown sentence '%.*s'", (int)(tok.end-tok.p), tok.p);
         }
         //if (!LOC_FIXED(r)) {
         //    VER("Location is not fixed, ignored callback\n");
         //} else if (r->fix.flags != 0 && gps_nmea_end_tag) {
         if (r->location_can_report) {
-#if NEMA_DEBUG
+#if NMEA_DEBUG
                 char   temp[256];
                 char*  p   = temp;
                 char*  end = p + sizeof(temp);
@@ -929,7 +932,7 @@ nmea_reader_parse(NmeaReader* const r)
                 }
                 gmtime_r((time_t*) &r->fix.timestamp, &utc);
                 p += snprintf(p, end-p, " time=%s", asctime(&utc));
-                VER(temp);
+                VER("%s", temp);
 #endif
 
                 callback_backup.location_cb(&r->fix);
@@ -1020,10 +1023,10 @@ gps_state_done(GpsState*  s)
         s->control[1] = -1;
         close(s->fd);
         s->fd = -1;
-        close(s->sockfd);
-        s->sockfd = -1;
-        close(s->epoll_hd);
-        s->epoll_hd = -1;
+	// close(s->fake_fd);
+        // s->fake_fd = -1;
+        close(s->epoll_fd);
+        s->epoll_fd = -1;
         s->init = 0;
         return;
 }
@@ -1094,7 +1097,7 @@ epoll_register(int  epoll_fd, int  fd)
                 ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
         } while (ret < 0 && errno == EINTR);
         if (ret < 0)
-                ERR("epoll ctl error, fd = %d, error num is %d\n, message is %s\n", fd, errno, strerror(errno));
+                ERR("epoll ctl error, fd = %d, error num is %d, message is %s\n", fd, errno, strerror(errno));
         return ret;
  }
 
@@ -1126,31 +1129,40 @@ gps_state_thread(void*  arg)
         int         gps_fd     = state->fd;
         int         control_fd = state->control[1];
 
-        int epoll_fd = state->epoll_hd;
+        int epoll_fd = state->epoll_fd;
 
         nmea_reader_init(reader);
 
-        if (control_fd == -1 || gps_fd == -1) {
+        if (control_fd < 0 || gps_fd < 0) {
                 ERR("control_fd = %d, gps_fd = %d", control_fd, gps_fd);
                 return;
         }
 
         //  register control file descriptors for polling
-        if (epoll_register(epoll_fd, control_fd) < 0)
-                ERR("epoll register control_fd error, error num is %d\n, message is %s\n", errno, strerror(errno));
-        if (epoll_register(epoll_fd, gps_fd) < 0)
-                ERR("epoll register gps_fd error, error num is %d\n, message is %s\n", errno, strerror(errno));
+        if (epoll_register(epoll_fd, control_fd) < 0) {
+                ERR("epoll register control_fd error, error num is %d, message is %s\n", errno, strerror(errno));
+		return;
+	}
 
-        DBG("gps thread running: PPID[%d], PID[%d]\n", getppid(), getpid());
+        if (epoll_register(epoll_fd, gps_fd) < 0) {
+                ERR("epoll register gps_fd error, error num is %d, message is %s\n", errno, strerror(errno));
+		return;
+	}
+
+        DBG("gps thread(v%d.%d) running: PPID[%d], PID[%d], EPOLL_FD[%d], GPSFD[%d]\n", MAJOR_NO, MINOR_NO, getppid(), getpid(), epoll_fd, gps_fd);
         DBG("HAL thread is ready, realease lock, and CMD_START can be handled\n");
         //  now loop
         for (;;) {
                 struct epoll_event   events[4];
                 int                  ne, nevents;
+		DBG("Call epoll wait, epoll_fd=%d", epoll_fd);
                 nevents = epoll_wait(epoll_fd, events, 2, -1);
                 if (nevents < 0) {
-                        if (errno != EINTR)
-                                ERR("epoll_wait() unexpected error: %s", strerror(errno));
+                        if (errno != EINTR) {
+                                ERR("epoll_wait() unexpected error: %s.", strerror(errno));
+				if (errno == EINVAL)
+					goto Exit;
+			}
                         continue;
                 }
                 VER("gps thread received %d events", nevents);
@@ -1215,7 +1227,7 @@ gps_state_thread(void*  arg)
                                                                 ERR("error while reading from gps daemon socket: %s: %p", strerror(errno), buff);
                                                         break;
                                                 }
-                                                DBG("received %d bytes:\n", ret);
+                                                DBG("received %d bytes.\n", ret);
                                                 gps_nmea_end_tag = 0;
                                                 for (nn = 0; nn < ret; nn++)
                                                 {
@@ -1246,12 +1258,16 @@ gps_state_init(GpsState*  state)
         state->control[0] = -1;
         state->control[1] = -1;
         state->fd         = -1;
+        // state->fake_fd	  = -1;
+	state->epoll_fd   = -1;
+
 
         DBG("Try open gps hardware:  %s", GPS_CHANNEL_NAME);
+	// state->fake_fd = open(GPS_CHANNEL_NAME, O_RDONLY);    // support poll behavior
+        // DBG("Open gps hardware: %s, fake_gps_fd=%d", GPS_CHANNEL_NAME, state->fake_fd);
         state->fd = open(GPS_CHANNEL_NAME, O_RDONLY);    // support poll behavior
+
         //state->fd = open(GPS_CHANNEL_NAME, O_RDWR | O_NONBLOCK | O_NOCTTY);
-        int epoll_fd   = epoll_create(2);
-        state->epoll_hd = epoll_fd;
 
         if (state->fd < 0) {
                 ERR("no gps hardware detected: %s:%d, %s", GPS_CHANNEL_NAME, state->fd, strerror(errno));
@@ -1265,7 +1281,12 @@ gps_state_init(GpsState*  state)
         cfsetospeed(&cfg, TTY_BAUD);
         tcsetattr(state->fd, TCSANOW, &cfg);
 
-        DBG("Open gps hardware succeed: %s", GPS_CHANNEL_NAME);
+        DBG("Open gps hardware succeed: %s, gps_fd=%d", GPS_CHANNEL_NAME, state->fd);
+
+        //int epoll_fd   = epoll_create(2);
+        int epoll_fd   = epoll_create1(0);
+        state->epoll_fd = epoll_fd;
+	DBG("Create epoll fd: %d, %s", epoll_fd, strerror(errno));
 
         if (socketpair(AF_LOCAL, SOCK_STREAM, 0, state->control) < 0) {
                 ERR("could not create thread control socket pair: %s", strerror(errno));
@@ -1509,8 +1530,8 @@ static struct hw_module_methods_t gps_module_methods = {
 
 struct hw_module_t HAL_MODULE_INFO_SYM = {
         .tag = HARDWARE_MODULE_TAG,
-        .version_major = 1,
-        .version_minor = 1,
+        .version_major = MAJOR_NO,
+        .version_minor = MINOR_NO,
         .id = GPS_HARDWARE_MODULE_ID,
         .name = "Hardware GPS Module",
         .author = "",
