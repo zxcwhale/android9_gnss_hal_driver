@@ -38,7 +38,7 @@
 #include <hardware/gps.h>
 
 #define MAJOR_NO	1
-#define MINOR_NO	3
+#define MINOR_NO	4
 #define UNUSED(x) (void)(x)
 #define MEASUREMENT_SUPPLY      0
 /* the name of the controlled socket */
@@ -125,7 +125,7 @@ nmea_tokenizer_init(NmeaTokenizer*  t, const char*  p, const char*  end)
 
         //  the initial '$' is optional
         if (p < end && p[0] == '$')
-                p += 1;gnss_fix_point
+                p += 1;
 
         //  remove trailing newline
         if (end > p && (*(end-1) == '\n')) {
@@ -137,7 +137,7 @@ nmea_tokenizer_init(NmeaTokenizer*  t, const char*  p, const char*  end)
         //  get rid of checksum at the end of the sentecne
         if (end >= p+3 && (*(end-3) == '*')) {
                 end -= 3;
-        }gnss_fix_point
+        }
 
         while (p < end) {
                 const char*  q = p;
@@ -1015,8 +1015,12 @@ static void
 gps_state_done(GpsState*  s)
 {
         char   cmd = CMD_QUIT;
+	void *dummy;
 
         write(s->control[0], &cmd, 1);
+	pthread_join(s->thread, &dummy);
+
+
         close(s->control[0]);
         s->control[0] = -1;
         close(s->control[1]);
@@ -1155,7 +1159,7 @@ gps_state_thread(void*  arg)
         for (;;) {
                 struct epoll_event   events[4];
                 int                  ne, nevents;
-		DBG("Call epoll wait, epoll_fd=%d", epoll_fd);
+		// DBG("Call epoll wait, epoll_fd=%d", epoll_fd);
                 nevents = epoll_wait(epoll_fd, events, 2, -1);
                 if (nevents < 0) {
                         if (errno != EINTR) {
@@ -1258,15 +1262,11 @@ gps_state_init(GpsState*  state)
         state->control[0] = -1;
         state->control[1] = -1;
         state->fd         = -1;
-        // state->fake_fd	  = -1;
 	state->epoll_fd   = -1;
 
 
         DBG("Try open gps hardware:  %s", GPS_CHANNEL_NAME);
-	// state->fake_fd = open(GPS_CHANNEL_NAME, O_RDONLY);    // support poll behavior
-        // DBG("Open gps hardware: %s, fake_gps_fd=%d", GPS_CHANNEL_NAME, state->fake_fd);
-        state->fd = open(GPS_CHANNEL_NAME, O_RDONLY);    // support poll behavior
-
+        state->fd = open(GPS_CHANNEL_NAME, O_RDONLY | O_NONBLOCK | O_NOCTTY);
         //state->fd = open(GPS_CHANNEL_NAME, O_RDWR | O_NONBLOCK | O_NOCTTY);
 
         if (state->fd < 0) {
@@ -1320,17 +1320,20 @@ zkw_gps_init(GpsCallbacks* callbacks)
         if (s->init)
                 return 0;
 
+        if ( callbacks != NULL && callbacks->size == sizeof(GpsCallbacks)) {
+                s->callbacks = *callbacks;
+                callback_backup = *callbacks;
+                gps_state_init(s);
+        } else {
+                ERR("Invalid callbacks.");
+        }
 
-        s->callbacks = *callbacks;
-        callback_backup = *callbacks;
-
-        gps_state_init(s);
-        s->init = 1;
         if (s->fd < 0) {
                 return -1;
         }
         DBG("Set GPS_CAPABILITY_SCHEDULING \n");
         callback_backup.set_capabilities_cb(GPS_CAPABILITY_SCHEDULING);
+        s->init = 1;
         return 0;
 }
 
@@ -1339,8 +1342,17 @@ zkw_gps_cleanup(void)
 {
         GpsState*  s = _gps_state;
 
+        char cmd = CMD_STOP;
+        int ret;
+
+        do {
+                ret = write(s->control[0], &cmd, 1);
+        } while(ret < 0 && errno == EINTR);
+
+        /*
         if (s->init)
                 gps_state_done(s);
+        */
         DBG("zkw_gps_cleanup done");
         //     return NULL;
 }
