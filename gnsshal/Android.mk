@@ -19,7 +19,7 @@ LOCAL_CFLAGS := -DHAVE_GPS_HARDWARE
 LOCAL_SHARED_LIBRARIES := liblog libcutils libhardware libc libutils
 
 LOCAL_MODULE := gps.$(TARGET_BOARD_PLATFORM)
-LOCAL_MODULE_TAGS := debug eng optional
+LOCAL_MODULE_TAGS := optional
 
 LOCAL_SRC_FILES := gps_zkw.c
 include $(BUILD_SHARED_LIBRARY)

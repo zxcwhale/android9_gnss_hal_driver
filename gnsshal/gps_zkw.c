@@ -37,14 +37,17 @@
 //#include <hardware/gps7.h>
 #include <hardware/gps.h>
 
-#define MAJOR_NO	1
-#define MINOR_NO	4
+#define MAJOR_NO	9
+#define MINOR_NO	5
 #define UNUSED(x) (void)(x)
 #define MEASUREMENT_SUPPLY      0
 /* the name of the controlled socket */
 #define GPS_CHANNEL_NAME        "/dev/ttyHS1"
 //#define TTY_BAUD                B115200
 #define TTY_BAUD                B9600
+
+#define REDUCE_SV_FREQ		0	// 0 - OFF, 1 - When gps_state_start(), 2 - When tty payload is high.
+#define TTY_BOOST		0
 
 #define SVID_PLUS_GLONASS       64
 #define SVID_PLUS_GALILEO       100
@@ -284,6 +287,7 @@ typedef struct {
         int             sv_status_can_report;
         int             location_can_report;
         char            sv_used_in_fix[MAX_GNSS_SVID];
+	double 		hdop;
         //GnssSvInfo      svlst[MAX_GNSS_SVID];
 } NmeaReader;
 
@@ -533,19 +537,11 @@ nmea_reader_update_speed(NmeaReader* const r,
 }
 
 // Add by LCH for accuracy
-static int
-nmea_reader_update_accuracy(NmeaReader* const r,
-                            Token accuracy)
+static void
+nmea_reader_update_accuracy(NmeaReader* const r, double hdop)
 {
-        //double  alt;
-        Token   tok = accuracy;
-
-        if (tok.p >= tok.end)
-                return -1;
-
         r->fix.flags   |= GPS_LOCATION_HAS_ACCURACY;
-        r->fix.accuracy = str2float(tok.p, tok.end);
-        return 0;
+        r->fix.accuracy = hdop;
 }
 
 /*
@@ -755,6 +751,7 @@ nmea_reader_parse(NmeaReader* const r)
                 Token  tok_latitudeHemi  = nmea_tokenizer_get(tzer, 3);
                 Token  tok_longitude     = nmea_tokenizer_get(tzer, 4);
                 Token  tok_longitudeHemi = nmea_tokenizer_get(tzer, 5);
+		Token  tok_hdop 	 = nmea_tokenizer_get(tzer, 8); // hdop
                 Token  tok_altitude      = nmea_tokenizer_get(tzer, 9);
                 Token  tok_altitudeUnits = nmea_tokenizer_get(tzer, 10);
 
@@ -764,6 +761,8 @@ nmea_reader_parse(NmeaReader* const r)
                                            tok_longitude,
                                            tok_longitudeHemi.p[0]);
                 nmea_reader_update_altitude(r, tok_altitude, tok_altitudeUnits);
+		r->hdop = str2float(tok_hdop.p, tok_hdop.end);
+		// nmea_reader_update_accuracy(r, tok_accuracy);
 
         }
         else if (!memcmp(tok.p, "GSA", 3)) {
@@ -790,8 +789,6 @@ nmea_reader_parse(NmeaReader* const r)
                 r->fix_mode = str2int(tok_fix.p, tok_fix.end);
 
                 if (LOC_FIXED(r)) {  /* 1: No fix; 2: 2D; 3: 3D*/
-                        Token  tok_accuracy = nmea_tokenizer_get(tzer, 15);
-                        nmea_reader_update_accuracy(r, tok_accuracy);   // pdop
 
                         for (idx = 0; idx < max; idx++) {
                                 Token tok_satellite = nmea_tokenizer_get(tzer, idx+3);
@@ -830,6 +827,7 @@ nmea_reader_parse(NmeaReader* const r)
 
                         nmea_reader_update_bearing(r, tok_bearing);
                         nmea_reader_update_speed(r, tok_speed);
+			nmea_reader_update_accuracy(r, r->hdop);
                         r->location_can_report = 1;
                 }
                 r->sv_status_can_report = 1;
@@ -889,7 +887,7 @@ nmea_reader_parse(NmeaReader* const r)
                 }
         }
         // Add for Accuracy
-        else if (!memcmp(tok.p, "ACCURACY", 8)) {
+	/* else if (!memcmp(tok.p, "ACCURACY", 8)) {
                 if ((r->fix_mode == 3) || (r->fix_mode == 2)) {
                         Token  tok_accuracy = nmea_tokenizer_get(tzer, 1);
                         nmea_reader_update_accuracy(r, tok_accuracy);
@@ -898,7 +896,7 @@ nmea_reader_parse(NmeaReader* const r)
                 else {
                         DBG("GPS get accuracy failed, fix mode:%d\n", r->fix_mode);
                 }
-        }
+        }*/
         else {
                 tok.p -= 2;
                 VER("unknown sentence '%.*s'", (int)(tok.end-tok.p), tok.p);
@@ -981,6 +979,45 @@ nmea_reader_parse(NmeaReader* const r)
         }
 }
 
+static void
+reduce_sv_freq()
+{
+	// Set GSA and GSV outputs once per 2 seconds
+	char msg[] = "$PCAS03,,,2,2,,,,,,,,,,*02\r\n";
+
+	write(_gps_state->fd, msg, strlen(msg));
+	DBG("Reduce GSA and GSV outputs freq.");
+}
+
+
+static void
+auto_reduce_sv_freq2(const NmeaReader *r)
+{
+        const int MAX_NBYTES = 960 * 2 * 0.85;
+
+        static int nbytes = 0;
+        static int rmc_counter = 0;
+
+        if (REDUCE_SV_FREQ != 2) {
+                //DBG("Reduce sv freq: OFF.");
+                return;
+        }
+
+        if (TTY_BAUD > B9600) {
+                DBG("High speed baudrate, no need to reduce sv freq.");
+                return;
+        }
+
+        nbytes += r->pos;
+        DBG("TTY payload rate=%d/%d.", nbytes, MAX_NBYTES);
+        if (nbytes > MAX_NBYTES) 
+		reduce_sv_freq();
+
+        // reset nbytes to 0 every 2 rmc
+        if (memcmp(r->in + 3, "RMC", 3) == 0) 
+                if (++rmc_counter % 2 == 0)
+                        nbytes = 0;
+}
 
 static void
 nmea_reader_addc(NmeaReader* const r, int  c)
@@ -1001,6 +1038,7 @@ nmea_reader_addc(NmeaReader* const r, int  c)
         r->pos       += 1;
 
         if (c == '\n') {
+		auto_reduce_sv_freq2(r);
                 nmea_reader_parse(r);
 
                 DBG("start nmea_cb\n");
@@ -1035,6 +1073,39 @@ gps_state_done(GpsState*  s)
         return;
 }
 
+static void
+try_boost_gnsstty(int tty_fd, int baud)
+{
+	const char msg[] = "$PCAS01,5*19\r\n";
+
+	if (TTY_BOOST == 0) {
+		DBG("TTY Boost OFF.");
+		return;
+	}
+
+	if (baud > B9600) {
+		DBG("No need to boost baudrate.");
+		return;
+	}
+
+        struct termios cfg;
+        tcgetattr(tty_fd, &cfg);
+        cfmakeraw(&cfg);
+        cfsetispeed(&cfg, baud);
+        cfsetospeed(&cfg, baud);
+        tcsetattr(tty_fd, TCSANOW, &cfg);
+
+	write(tty_fd, msg, strlen(msg));
+
+	usleep(200 * 1000);	// sleep 200ms to make sure msg is send at TTY_BAUD
+
+	// Upgrade tty's baudrate to 115200
+        cfsetispeed(&cfg, B115200);
+        cfsetospeed(&cfg, B115200);
+        tcsetattr(tty_fd, TCSANOW, &cfg);
+
+	DBG("Boost baudrate to 115200.");
+}
 
 static void
 gps_state_start(GpsState*  s)
@@ -1050,6 +1121,12 @@ gps_state_start(GpsState*  s)
         if (ret != 1)
                 ERR("%s: could not send CMD_START command: ret=%d: %s",
                     __FUNCTION__, ret, strerror(errno));
+
+	// Try Boost baudrate
+	try_boost_gnsstty(s->fd, TTY_BAUD);
+
+	if (REDUCE_SV_FREQ == 1)
+		reduce_sv_freq();
 }
 
 static void
@@ -1298,7 +1375,9 @@ gps_state_init(GpsState*  state)
                 goto Fail;
         }
 
-        DBG("gps state initialized, the thread is %d\n", (int)state->thread);
+        DBG("gps state initialized, the thread is %d", (int)state->thread);
+	DBG("TTY_BOOST=%d, REDUCE_SV_FREQ=%d.", TTY_BAUD, REDUCE_SV_FREQ);
+
         return;
 
 Fail:
