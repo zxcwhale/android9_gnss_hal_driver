@@ -330,6 +330,7 @@ nmea_reader_init(NmeaReader* const r)
         //r->sv_count = 0;
         r->fix_mode = 0;    /*no fix*/
         r->cb_status_changed = 0;
+	r->hdop = 99.0;
         //memset((void*)&r->sv_status_gps, 0x00, sizeof(r->sv_status_gps));
         memset((void*)&r->sv_status_gnss, 0x00, sizeof(r->sv_status_gnss));
         memset((void*)&r->in, 0x00, sizeof(r->in));
