@@ -1344,8 +1344,8 @@ gps_state_init(GpsState*  state)
 
 
         DBG("Try open gps hardware:  %s", GPS_CHANNEL_NAME);
-        state->fd = open(GPS_CHANNEL_NAME, O_RDONLY | O_NONBLOCK | O_NOCTTY);
-        //state->fd = open(GPS_CHANNEL_NAME, O_RDWR | O_NONBLOCK | O_NOCTTY);
+        //state->fd = open(GPS_CHANNEL_NAME, O_RDONLY | O_NONBLOCK | O_NOCTTY);
+        state->fd = open(GPS_CHANNEL_NAME, O_RDWR | O_NONBLOCK | O_NOCTTY);
 
         if (state->fd < 0) {
                 ERR("no gps hardware detected: %s:%d, %s", GPS_CHANNEL_NAME, state->fd, strerror(errno));
