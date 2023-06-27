@@ -1309,7 +1309,8 @@ gps_state_thread(void*  arg)
                                                                 ERR("error while reading from gps daemon socket: %s: %p", strerror(errno), buff);
                                                         break;
                                                 }
-                                                DBG("received %d bytes.\n", ret);
+                                                //DBG("received %d bytes.\n", ret);
+						DBG("gps fd received: %.*s bytes: %d\n", ret, buff, ret);
                                                 gps_nmea_end_tag = 0;
                                                 for (nn = 0; nn < ret; nn++)
                                                 {
