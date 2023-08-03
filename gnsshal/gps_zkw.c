@@ -38,13 +38,14 @@
 #include <hardware/gps.h>
 
 #define MAJOR_NO	9
-#define MINOR_NO	5
+#define MINOR_NO	6
 #define UNUSED(x) (void)(x)
 #define MEASUREMENT_SUPPLY      0
 /* the name of the controlled socket */
-#define GPS_CHANNEL_NAME        "/dev/ttyHS1"
-//#define TTY_BAUD                B115200
-#define TTY_BAUD                B9600
+#define GPS_CHANNEL_NAME        "/dev/ttyAMA3"
+//#define TTY_BAUD                B9600
+#define TTY_BAUD                B115200
+#define LEGACY_MODE		0
 
 #define REDUCE_SV_FREQ		0	// 0 - OFF, 1 - When gps_state_start(), 2 - When tty payload is high.
 #define TTY_BOOST		0
@@ -249,7 +250,7 @@ struct svinfo_raw {
 */
 
 #define HAS_CARRIER_FREQUENCY(p)        ((p) >= '1' && (p) <= '9')
-#define MAX_GNSS_SVID   300
+#define MAX_GNSS_SVID   320
 // #define  NMEA_MAX_SIZE  83
 #define  NMEA_MAX_SIZE  256
 /*maximum number of SV information in GPGSV*/
@@ -278,8 +279,9 @@ typedef struct {
          * (2) GPS_STATUS_SESSION_END:   receive location fix + flag set + callback is null
          */
         int             cb_status_changed;
-        int             sv_count;           /*used to count the number of received SV information*/
+        //int             sv_count;           /*used to count the number of received SV information*/
         //GpsSvStatus     sv_status_gps;
+	GpsSvStatus 	legacy_sv_status_gps;
         GnssSvStatus    sv_status_gnss;
         GpsCallbacks    callbacks;
         GnssData        gnss_data;
@@ -332,6 +334,7 @@ nmea_reader_init(NmeaReader* const r)
         r->cb_status_changed = 0;
 	r->hdop = 99.0;
         //memset((void*)&r->sv_status_gps, 0x00, sizeof(r->sv_status_gps));
+	memset((void*)&r->legacy_sv_status_gps, 0, sizeof(r->legacy_sv_status_gps));
         memset((void*)&r->sv_status_gnss, 0x00, sizeof(r->sv_status_gnss));
         memset((void*)&r->in, 0x00, sizeof(r->in));
 
@@ -670,13 +673,43 @@ nmea_reader_update_gnss_measurement(NmeaReader*r, int sv_type, int prn, Token fr
 }
 
 static int
+nmea_reader_update_legacy_sv_status_gps(NmeaReader *r, int sv_type, int prn, Token elev, Token azim, Token snr)
+{
+	if (LEGACY_MODE == 0)
+		return 2;
+
+	int k = r->legacy_sv_status_gps.num_svs;
+	if (k >= GPS_MAX_SVS) {
+                ERR("SV list full(%d).\n", k);
+                return 1;
+	}
+
+	int svid = prn2svid(prn, sv_type);
+	int in_use = r->sv_used_in_fix[svid];
+	if (in_use)
+		r->legacy_sv_status_gps.used_in_fix_mask |= (1 << k);
+
+	r->legacy_sv_status_gps.sv_list[k].prn = svid;
+	r->legacy_sv_status_gps.sv_list[k].elevation = str2float(elev.p, elev.end);
+	r->legacy_sv_status_gps.sv_list[k].azimuth = str2float(azim.p, azim.end);
+	r->legacy_sv_status_gps.sv_list[k].snr = str2float(snr.p, snr.end);
+	r->legacy_sv_status_gps.num_svs++;
+	DBG("Update legacy SV: prn=%d svid=%d, sv_type=%d, in_use=%d.\n", prn, svid, sv_type, in_use);
+	return 0;
+}
+
+static int
 nmea_reader_update_sv_status_gnss(NmeaReader* r, int sv_type, int prn, Token elevation, Token azimuth, Token snr)
 {
+	if (LEGACY_MODE != 0)
+		return 2;
         int sv_index = r->sv_status_gnss.num_svs;
         if (GNSS_MAX_SVS <= sv_index) {
                 ERR("ERR: sv_index=[%d] is larger than GNSS_MAX_SVS.\n", sv_index);
                 return 1;
         }
+	if (sv_type == GNSS_CONSTELLATION_GLONASS && prn > SVID_PLUS_GLONASS)
+		prn -= SVID_PLUS_GLONASS;
         r->sv_status_gnss.gnss_sv_list[sv_index].svid = prn;
         r->sv_status_gnss.gnss_sv_list[sv_index].constellation = sv_type;
 
@@ -870,6 +903,7 @@ nmea_reader_parse(NmeaReader* const r)
                         sv_arr[idx].constellation = sv_type;
                         */
                         nmea_reader_update_sv_status_gnss(r, sv_type, prn, tok_ele, tok_azi, tok_snr);
+			nmea_reader_update_legacy_sv_status_gps(r, sv_type, prn, tok_ele, tok_azi, tok_snr);
                         if (HAS_CARRIER_FREQUENCY(tok_frq.p[0]))
                                 nmea_reader_update_gnss_measurement(r, sv_type, prn, tok_frq);
                 }
@@ -939,19 +973,27 @@ nmea_reader_parse(NmeaReader* const r)
                 r->location_can_report = 0;
         }
 
-        DBG("r->sv_status_gnss.num_svs = %d, gps_nmea_end_tag = %d, sv_status_can_report = %d", 
-                r->sv_status_gnss.num_svs, gps_nmea_end_tag, r->sv_status_can_report);
+        DBG("gnss_num = %d, legacy_gps_num=%d, gps_nmea_end_tag = %d, sv_status_can_report = %d", 
+                r->sv_status_gnss.num_svs, r->legacy_sv_status_gps.num_svs, gps_nmea_end_tag, r->sv_status_can_report);
         if (r->sv_status_can_report) {
-                DBG("Report sv status, num = %d", r->sv_status_gnss.num_svs);
-                if (r->sv_status_gnss.num_svs > 0) {
+                if (LEGACY_MODE == 0 && r->sv_status_gnss.num_svs > 0) {
+                	DBG("Report sv status, num = %d, cb=%p.", r->sv_status_gnss.num_svs, callback_backup.gnss_sv_status_cb);
                         r->sv_status_gnss.size = sizeof(GnssSvStatus);
                         callback_backup.gnss_sv_status_cb(&r->sv_status_gnss);
                         //r->sv_count = r->sv_status_gnss.num_svs = 0;
                         memset(r->sv_used_in_fix, 0, sizeof(r->sv_used_in_fix));
                         memset(&r->sv_status_gnss, 0, sizeof(r->sv_status_gnss));
                 }
+		
+		if (LEGACY_MODE != 0 && r->legacy_sv_status_gps.num_svs > 0) {
+                	DBG("Report legacy sv status, num = %d, cb=%p.", r->legacy_sv_status_gps.num_svs, callback_backup.sv_status_cb);
+			r->legacy_sv_status_gps.size = sizeof(GpsSvStatus);
+			callback_backup.sv_status_cb(&r->legacy_sv_status_gps);
+                        memset(r->sv_used_in_fix, 0, sizeof(r->sv_used_in_fix));
+			memset(&r->legacy_sv_status_gps, 0, sizeof(r->legacy_sv_status_gps));
+		}
                 DBG("Report gnss measurements, num = %d, measure_on = %d", 
-                                        (int)r->gnss_data.measurement_count, is_measurement);
+		(int)r->gnss_data.measurement_count, is_measurement);
                 if (r->gnss_data.measurement_count > 0) {
                         r->gnss_data.size = sizeof(GnssData);
                         if (is_measurement)
@@ -1596,7 +1638,7 @@ const GpsInterface* gps__get_gps_interface(struct gps_device_t* dev)
 
 static int open_gps(const struct hw_module_t* module, char const* name,
                     struct hw_device_t** device) {
-        DBG("open_gps HAL 1: name=%s.\n", name);
+        DBG("open_gps HAL 1: name=%s ver=%d.%d.\n", name, MAJOR_NO, MINOR_NO);
         struct gps_device_t *dev = malloc(sizeof(struct gps_device_t));
         if (dev != NULL) {
                 memset(dev, 0, sizeof(*dev));
