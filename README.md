@@ -1,10 +1,12 @@
 # 卫星定位接收机HAL驱动
 
-适用于Android9.0或以上版本.
+适用于Android9 - 13.
 
 对于Android4, Android5, Android6, 请使用项目[android_hal_gpsbds](https://github.com/zxcwhale/android_hal_gpsbds).
 
 对于Android7, Android8, 请使用项目[android7_gnss_hal_driver](https://github.com/zxcwhale/android7_gnss_hal_driver).
+
+对于Android12,13, 请使用项目[aosp13_gnsshal](https://github.com/zxcwhale/aosp13_gnss_hal), 获得更好的支持.
 
 ## 配置编译环境
 
