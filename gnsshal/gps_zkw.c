@@ -1081,6 +1081,7 @@ gps_state_done(GpsState*  s)
         close(s->epoll_fd);
         s->epoll_fd = -1;
         s->init = 0;
+	DBG("All fd closed");
         return;
 }
 
