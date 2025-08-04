@@ -1053,12 +1053,22 @@ nmea_reader_addc(NmeaReader* const r, int  c)
 static void
 gps_state_done(GpsState*  s)
 {
+	/*
         char   cmd = CMD_QUIT;
 	void *dummy;
 
         write(s->control[0], &cmd, 1);
 	pthread_join(s->thread, &dummy);
+ 	*/
+        char cmd = CMD_QUIT;
+        int ret;
 
+	DBG("Send CMD_QUIT");
+        do {
+                ret = write(s->control[0], &cmd, 1);
+        } while(ret < 0 && errno == EINTR);
+	
+	usleep(50 * 1000);
 
         close(s->control[0]);
         s->control[0] = -1;
@@ -1422,15 +1432,7 @@ static void
 zkw_gps_cleanup(void)
 {
         GpsState*  s = _gps_state;
-
-        char cmd = CMD_STOP;
-        int ret;
-
-        do {
-                ret = write(s->control[0], &cmd, 1);
-        } while(ret < 0 && errno == EINTR);
-	usleep(50 * 1000);
-        
+       
         if (s->init)
                 gps_state_done(s);
         
