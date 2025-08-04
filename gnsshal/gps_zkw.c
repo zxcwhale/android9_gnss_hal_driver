@@ -37,7 +37,7 @@
 #include <hardware/gps.h>
 
 #define MAJOR_NO	9
-#define MINOR_NO	7
+#define MINOR_NO	8
 #define UNUSED(x) (void)(x)
 #define MEASUREMENT_SUPPLY      0
 /* the name of the controlled socket */
