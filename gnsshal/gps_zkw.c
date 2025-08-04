@@ -1429,11 +1429,11 @@ zkw_gps_cleanup(void)
         do {
                 ret = write(s->control[0], &cmd, 1);
         } while(ret < 0 && errno == EINTR);
-
-        /*
+	usleep(50 * 1000);
+        
         if (s->init)
                 gps_state_done(s);
-        */
+        
         DBG("zkw_gps_cleanup done");
         //     return NULL;
 }
